@@ -13,12 +13,34 @@ st.set_page_config(page_title="AI Finance Planner", page_icon="💸")
 st.title("💸 AI Finance Planner Agent")
 st.write("Budget • Savings • Live Stock Price • News • Web Search")
 
-query = st.text_input("Ask something:", placeholder="e.g. Make a budget for salary 50k")
+# ✅ Initialize conversation history in session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-if st.button("Run"):
-    if not query.strip():
-        st.warning("Enter a query first.")
-    else:
+# ✅ Display all previous messages
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+
+# ✅ Chat input
+if query := st.chat_input("Ask something (e.g., Make a budget for salary 50k)"):
+    # Add user message to history and display it
+    st.session_state.messages.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.write(query)
+    
+    # Get agent response WITH conversation history
+    with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            output = run_finance_agent(query)
+            # ✅ Pass the full chat history to the agent
+            output = run_finance_agent(query, chat_history=st.session_state.messages)
         st.write(output)
+    
+    # Add assistant response to history
+    st.session_state.messages.append({"role": "assistant", "content": output})
+
+# ✅ Optional: Add a "Clear Chat" button in the sidebar
+with st.sidebar:
+    if st.button("🗑️ Clear Chat History"):
+        st.session_state.messages = []
+        st.rerun()

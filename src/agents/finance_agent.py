@@ -1,7 +1,8 @@
 # src/agents/finance_agent.py
 
 import re
-from typing import Optional
+from typing import Optional, List, Dict
+from datetime import datetime
 
 from src.llm import get_llm
 from src.tools.web_search import web_search
@@ -95,6 +96,40 @@ def extract_months(text: str) -> Optional[int]:
     return None
 
 
+def detect_and_format_date_query(query: str) -> Optional[str]:
+    """
+    Detects if query is asking for news from a specific date and reformats it
+    for better web search results.
+    
+    Examples:
+    - "news of 1 jan 2026" -> "news headlines January 1 2026"
+    - "give me news from 15th january" -> "news headlines January 15 2026"
+    - "what happened on 5 jan" -> "what happened January 5 2026"
+    """
+    q_lower = query.lower()
+    
+    # Common date patterns
+    date_patterns = [
+        r'(\d{1,2})\s*(st|nd|rd|th)?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{4})?',
+        r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{1,2})\s*(st|nd|rd|th)?\s*(\d{4})?',
+        r'(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})',
+    ]
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, q_lower)
+        if match:
+            # If year not provided, assume current year
+            current_year = datetime.now().year
+            
+            # Reformat the query to be more search-friendly
+            if "what happened" in q_lower:
+                return f"what happened on {match.group(0)} news headlines"
+            else:
+                return f"news headlines {match.group(0)} {current_year if len(match.groups()) < 4 else ''}"
+    
+    return None
+
+
 def fallback_symbol_from_web(company_query: str) -> str:
     """
     If Finnhub symbol lookup fails, use Tavily web search to guess ticker.
@@ -128,78 +163,156 @@ def fallback_symbol_from_web(company_query: str) -> str:
     return "AAPL"
 
 
+def build_conversation_context(chat_history: List[Dict]) -> str:
+    """
+    Converts chat history into a readable context string for the LLM.
+    """
+    if not chat_history:
+        return ""
+    
+    context = "Previous conversation:\n"
+    for msg in chat_history[-6:]:  # Only keep last 6 messages to avoid token limits
+        role = "User" if msg["role"] == "user" else "Assistant"
+        context += f"{role}: {msg['content']}\n"
+    
+    return context + "\n"
+
+
+def format_with_llm(user_query: str, data, chat_history: List[Dict] = None) -> str:
+    """
+    Takes raw data (JSON, dict, or any structured format) and asks LLM 
+    to format it conversationally based on the user's original question.
+    Now includes conversation context for better responses.
+    """
+    try:
+        llm = get_llm()
+        
+        # Build context from chat history
+        context = build_conversation_context(chat_history or [])
+        
+        prompt = f"""{context}User's current question: "{user_query}"
+
+I retrieved this data: {data}
+
+Please provide a clear, conversational response to the user's question using this data. 
+If the user is asking a follow-up question, use the conversation context to understand what they're referring to.
+Format numbers nicely, explain what the data means, and be helpful and friendly.
+Do not just repeat the JSON - make it readable and useful for a human."""
+
+        res = llm.invoke(prompt)
+        return res.content
+    except Exception as e:
+        # If LLM fails, return the raw data as fallback
+        return f"Here's what I found: {data}\n\n(Note: Formatting failed - {str(e)})"
+
+
 # -----------------------------
 # Main Router Agent
 # -----------------------------
 
-def run_finance_agent(user_query: str):
+def run_finance_agent(user_query: str, chat_history: List[Dict] = None):
+    """
+    Main agent that routes queries to appropriate tools.
+    
+    Args:
+        user_query: The current user question
+        chat_history: List of previous messages [{"role": "user/assistant", "content": "..."}]
+    """
+    if chat_history is None:
+        chat_history = []
+    
     q = user_query.lower().strip()
 
-    # ✅ 1) Time-sensitive queries -> always web search
-    # Tavily invoke uses {"query": "..."} per docs.
-    # :contentReference[oaicite:4]{index=4}
+    # ✅ 1) Time-sensitive queries -> web search -> format with LLM
     if any(word in q for word in TIME_SENSITIVE):
-        return web_search(user_query)
+        search_results = web_search(user_query)
+        return format_with_llm(user_query, search_results, chat_history)
 
-    # ✅ 2) STOCK PRICE -> Finnhub symbol lookup -> Finnhub quote
-    # Finnhub symbol search endpoint: /search?q=...
-    # :contentReference[oaicite:5]{index=5}
+    # ✅ 2) STOCK PRICE -> get data -> format with LLM
     if ("stock price" in q) or ("share price" in q) or ("price of" in q):
         clean_q = clean_company_query(user_query)
 
-        lookup = symbol_lookup(clean_q)
-
-        # If symbol_lookup failed, fallback to web guessed symbol
-        if isinstance(lookup, dict) and lookup.get("error"):
-            symbol = fallback_symbol_from_web(user_query)
+        # Try direct ticker first
+        direct_ticker = extract_ticker(user_query)
+        
+        if direct_ticker:
+            symbol = direct_ticker
         else:
-            results = lookup.get("result", []) if isinstance(lookup, dict) else []
-            symbol = results[0].get("symbol") if results else None
-            if not symbol:
+            # Try Finnhub symbol lookup
+            lookup = symbol_lookup(clean_q)
+            
+            if isinstance(lookup, dict) and lookup.get("error"):
                 symbol = fallback_symbol_from_web(user_query)
+            else:
+                results = lookup.get("result", []) if isinstance(lookup, dict) else []
+                if results:
+                    symbol = results[0].get("symbol")
+                else:
+                    symbol = fallback_symbol_from_web(user_query)
 
-        # Try Finnhub quote
+        # Get price from Finnhub
         price_data = get_stock_price(symbol)
 
-        # If Finnhub quote fails due to plan/market access (403 etc), fallback to web search
-        # Permissions errors are commonly reported as 403 Forbidden.
-        # :contentReference[oaicite:6]{index=6}
-        if isinstance(price_data, dict) and price_data.get("error"):
-            return web_search(f"{user_query} live stock price")
+        # If Finnhub returns error or zeros, fallback to web search
+        if isinstance(price_data, dict):
+            if price_data.get("error") or price_data.get("current", 0) == 0:
+                search_results = web_search(f"{user_query} live stock price current")
+                return format_with_llm(user_query, search_results, chat_history)
 
-        return price_data
+        # Format price data conversationally
+        return format_with_llm(user_query, price_data, chat_history)
 
-    # ✅ 3) COMPANY NEWS -> Finnhub company-news tool
+    # ✅ 3) COMPANY NEWS (IMPROVED - handles company-specific, general, and date-based news)
     if "news" in q:
+        # First check if this is a date-based news query
+        formatted_date_query = detect_and_format_date_query(user_query)
+        if formatted_date_query:
+            # This is a date-specific news request, use web search with better formatting
+            search_results = web_search(formatted_date_query)
+            return format_with_llm(user_query, search_results, chat_history)
+        
+        # Check if user mentioned a specific company/ticker
         symbol = extract_ticker(user_query)
-
+        
         if not symbol:
             clean_q = clean_company_query(user_query)
             lookup = symbol_lookup(clean_q)
-
+            
             if isinstance(lookup, dict) and not lookup.get("error"):
                 results = lookup.get("result", [])
                 if results:
                     symbol = results[0].get("symbol")
+        
+        # If we found a company symbol, get company-specific news
+        if symbol:
+            news_data = get_company_news(symbol)
+            # Check if news data is empty or has errors
+            if isinstance(news_data, dict) and (news_data.get("error") or not news_data.get("data")):
+                # Fallback to web search if Finnhub fails
+                search_results = web_search(user_query)
+                return format_with_llm(user_query, search_results, chat_history)
+            return format_with_llm(user_query, news_data, chat_history)
+        else:
+            # No company found - this is a general news query, use web search
+            search_results = web_search(user_query)
+            return format_with_llm(user_query, search_results, chat_history)
 
-        symbol = symbol or "AAPL"
-        return get_company_news(symbol)
-
-    # ✅ 4) GOAL SAVING (e.g., "2 lakh in 10 months")
+    # ✅ 4) GOAL SAVING -> calculate -> format with LLM
     if ("save" in q or "saving" in q) and ("month" in q or "months" in q):
         goal_amount = parse_indian_amount(q)
         months = extract_months(q)
 
         if goal_amount and months and months > 0:
             per_month = goal_amount / months
-            return {
+            savings_data = {
                 "goal_amount": goal_amount,
                 "months": months,
                 "monthly_saving_required": round(per_month, 2),
                 "tip": "Automate saving via SIP/RD so you don't miss months."
             }
+            return format_with_llm(user_query, savings_data, chat_history)
 
-    # ✅ 5) BUDGET / SALARY / INCOME
+    # ✅ 5) BUDGET / SALARY / INCOME -> calculate -> format with LLM
     if "salary" in q or "income" in q or "budget" in q:
         income = parse_indian_amount(q) or 50000
 
@@ -207,14 +320,20 @@ def run_finance_agent(user_query: str):
         fixed = round(income * 0.50)
         variable = round(income * 0.30)
 
-        return budget_plan(income=income, fixed=fixed, variable=variable)
+        budget_data = budget_plan(income=income, fixed=fixed, variable=variable)
+        return format_with_llm(user_query, budget_data, chat_history)
 
-    # ✅ 6) Default -> Groq LLM (safe try/except)
-    # Groq requires GROQ_API_KEY env var or passing key explicitly.
-    # :contentReference[oaicite:7]{index=7}
+    # ✅ 6) Default -> Groq LLM with conversation context
     try:
         llm = get_llm()
-        res = llm.invoke(user_query)
+        
+        # Build conversation context
+        context = build_conversation_context(chat_history)
+        
+        # Add context to the query
+        full_prompt = f"{context}User's current question: {user_query}\n\nPlease provide a helpful response based on the conversation context."
+        
+        res = llm.invoke(full_prompt)
         return res.content
     except Exception as e:
         return {
@@ -222,3 +341,4 @@ def run_finance_agent(user_query: str):
             "message": str(e),
             "fallback": "Ask a time-sensitive query (latest/current/news) so it uses web search."
         }
+    
