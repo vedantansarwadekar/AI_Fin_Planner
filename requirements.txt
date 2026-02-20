@@ -11,3 +11,4 @@ tavily-python
 requests
 python-dotenv
 finnhub-python
+langchain-tavily
