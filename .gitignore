@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables / secrets
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor/OS files
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+
+echo ".streamlit/secrets.toml" >> .gitignore
+auth_config.yaml
+auth_config.yaml
+data/atom.db
+
+
+.streamlit/
