@@ -1,11 +1,11 @@
 import os
 import sys
 import glob
-import toml
-import pathlib
+import yaml
 import streamlit as st
 import pandas as pd
 import streamlit_authenticator as stauth
+from yaml.loader import SafeLoader
 
 # --------------------------------------------------
 # Fix import path
@@ -13,6 +13,8 @@ import streamlit_authenticator as stauth
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT_DIR)
 
+from src.theme import apply_theme, page_title, capability_chips, sidebar_user_badge
+from src.agents.workspace_agent import run_workspace_agent
 from src.agents.finance_agent import run_finance_agent
 from src.agents.rag_agent import StockMarketRAGAgent
 from src.agents.data_agent import DataAnalystAgent
@@ -23,12 +25,25 @@ from src.database import (
     save_rag_message, get_rag_history, clear_rag_history,
 )
 from src.llm import get_usage_stats
+from src.password_reset import generate_reset_token, validate_reset_token, apply_new_password
 from src.config import AUTH_COOKIE_SECRET
+from src.user_docs import (
+    upload_document,
+    get_user_documents,
+    delete_document,
+    user_rag_ask,
+)
 
 # --------------------------------------------------
 # Bootstrap DB on every start (creates tables if missing)
 # --------------------------------------------------
 init_db()
+
+# --------------------------------------------------
+# CHECK FOR PASSWORD RESET TOKEN IN URL
+# --------------------------------------------------
+_url_params      = st.query_params
+_reset_token_url = _url_params.get("reset_token", "")
 
 # --------------------------------------------------
 # Page Config
@@ -37,217 +52,44 @@ st.set_page_config(
     page_title="ATOM – Multi-Agent AI Platform",
     page_icon="🤖",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 # --------------------------------------------------
-# THEME CSS
+# THEME — Dark Glassmorphism
 # --------------------------------------------------
-st.markdown("""
-<style>
-.stApp { background-color: #f5f5f7 !important; }
-.block-container { padding-top: 2rem !important; }
-
-.stApp p, .stApp span, .stApp div,
-.stApp label, .stApp li, .stApp h1, .stApp h2,
-.stApp h3, .stApp h4, .stApp h5, .stApp h6 {
-    color: #1d1d1f;
-}
-
-div[data-testid="stAppViewBlockContainer"] .stButton > button,
-div[data-testid="stVerticalBlock"] .stButton > button {
-    background-color: #111827 !important;
-    color: #ffffff !important;
-    border: none !important;
-    border-radius: 8px !important;
-}
-div[data-testid="stAppViewBlockContainer"] .stButton > button p,
-div[data-testid="stAppViewBlockContainer"] .stButton > button span,
-div[data-testid="stVerticalBlock"] .stButton > button p,
-div[data-testid="stVerticalBlock"] .stButton > button span {
-    color: #ffffff !important;
-}
-div[data-testid="stAppViewBlockContainer"] .stButton > button:hover,
-div[data-testid="stVerticalBlock"] .stButton > button:hover {
-    background-color: #000000 !important;
-}
-
-div[data-testid="stFileUploader"] button {
-    background-color: #111827 !important;
-    color: #ffffff !important;
-    border-radius: 8px !important;
-}
-div[data-testid="stFileUploader"] button span,
-div[data-testid="stFileUploader"] button p { color: #ffffff !important; }
-
-div[data-testid="stTextInput"] input,
-div[data-testid="stNumberInput"] input {
-    background-color: #ffffff !important;
-    color: #1d1d1f !important;
-    border: 1px solid #d1d1d6 !important;
-    border-radius: 8px !important;
-}
-
-div[data-testid="stSelectbox"] > div > div,
-div[data-testid="stSelectbox"] > div > div > div {
-    background-color: #ffffff !important;
-    color: #1d1d1f !important;
-    border: 1px solid #d1d1d6 !important;
-    border-radius: 8px !important;
-}
-div[data-testid="stSelectbox"] label,
-div[data-testid="stSelectbox"] p,
-div[data-testid="stSelectbox"] span { color: #1d1d1f !important; }
-[data-testid="stSelectboxVirtualDropdown"],
-[data-testid="stSelectboxVirtualDropdown"] * {
-    background-color: #ffffff !important;
-    color: #1d1d1f !important;
-}
-
-div[data-testid="stRadio"] label,
-div[data-testid="stRadio"] p,
-div[data-testid="stRadio"] span { color: #1d1d1f !important; }
-
-div[data-testid="stColorPicker"] label,
-div[data-testid="stColorPicker"] p,
-div[data-testid="stColorPicker"] span { color: #1d1d1f !important; }
-
-div[data-testid="stFileUploader"] label,
-div[data-testid="stFileUploader"] p,
-div[data-testid="stFileUploader"] span { color: #1d1d1f !important; }
-div[data-testid="stFileUploader"] > section {
-    background-color: #ffffff !important;
-    border: 1px dashed #d1d1d6 !important;
-    border-radius: 8px !important;
-}
-
-div[data-testid="stExpander"] {
-    background-color: #ffffff !important;
-    border: 1px solid #e5e5e7 !important;
-    border-radius: 8px !important;
-}
-div[data-testid="stExpander"] summary,
-div[data-testid="stExpander"] p,
-div[data-testid="stExpander"] span { color: #1d1d1f !important; }
-
-div[data-testid="stAlert"] p,
-div[data-testid="stAlert"] span,
-div[data-testid="stAlert"] div { color: #1d1d1f !important; }
-
-div[data-testid="stCaptionContainer"] p { color: #555555 !important; }
-div[data-testid="stDataFrame"] * { color: #1d1d1f !important; }
-div[data-testid="stMetric"] * { color: #1d1d1f !important; }
-
-div[data-testid="stTabs"] button,
-div[data-testid="stTabs"] button p,
-div[data-testid="stTabs"] button span { color: #1d1d1f !important; }
-
-hr { border-color: #e5e5e7 !important; }
-
-section[data-testid="stSidebar"] {
-    background-color: #ffffff !important;
-    border-right: 1px solid #e5e5e7 !important;
-}
-section[data-testid="stSidebar"] * { color: #1d1d1f !important; }
-section[data-testid="stSidebar"] .stButton > button {
-    background-color: #ffffff !important;
-    color: #1d1d1f !important;
-    border: 1px solid #d1d1d6 !important;
-    border-radius: 25px !important;
-}
-section[data-testid="stSidebar"] .stButton > button *,
-section[data-testid="stSidebar"] .stButton > button span,
-section[data-testid="stSidebar"] .stButton > button p {
-    color: #1d1d1f !important;
-    background-color: transparent !important;
-}
-section[data-testid="stSidebar"] .stButton > button:hover { background-color: #f2f2f2 !important; }
-section[data-testid="stSidebar"] .stButton > button:hover * { color: #1d1d1f !important; }
-
-div[data-testid="stChatInput"] textarea {
-    background-color: #ffffff !important;
-    color: #1d1d1f !important;
-    border: 1px solid #d1d1d6 !important;
-}
-div[data-testid="stChatInput"] button {
-    background-color: #1d1d1f !important;
-    color: white !important;
-    border-radius: 50% !important;
-}
-
-div[data-testid="stChatMessage"] * { color: #1d1d1f !important; }
-div[data-testid="stChatMessage"][data-message-author-role="user"] { background-color: #e8e8ed !important; }
-div[data-testid="stChatMessage"][data-message-author-role="assistant"] { background-color: #ffffff !important; }
-
-header[data-testid="stHeader"] {
-    background-color: #1d1d1f !important;
-}
-header[data-testid="stHeader"] button,
-header[data-testid="stHeader"] button span,
-header[data-testid="stHeader"] button svg,
-header[data-testid="stHeader"] a,
-header[data-testid="stHeader"] span,
-header[data-testid="stHeader"] p {
-    color: #ffffff !important;
-    fill: #ffffff !important;
-}
-
-section[data-testid="stSidebar"] .stBadge,
-section[data-testid="stSidebar"] [data-testid="stBadge"],
-section[data-testid="stSidebar"] code,
-section[data-testid="stSidebar"] .stCode {
-    background-color: #e8e8ed !important;
-    color: #1d1d1f !important;
-}
-section[data-testid="stSidebar"] code * {
-    color: #1d1d1f !important;
-}
-
-div[data-testid="stForm"] input {
-    background-color: #ffffff !important;
-    color: #1d1d1f !important;
-    border: 1px solid #d1d1d6 !important;
-    border-radius: 8px !important;
-}
-div[data-testid="stForm"] label,
-div[data-testid="stForm"] p,
-div[data-testid="stForm"] span {
-    color: #1d1d1f !important;
-}
-
-div[data-testid="stTabs"] button[role="tab"] {
-    background-color: #f5f5f7 !important;
-    color: #1d1d1f !important;
-    border-radius: 8px 8px 0 0 !important;
-}
-div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
-    background-color: #ffffff !important;
-    border-bottom: 2px solid #111827 !important;
-}
-</style>
-""", unsafe_allow_html=True)
+apply_theme()
 
 # --------------------------------------------------
-# LOAD AUTH CONFIG — read raw TOML to get a plain dict
-# that streamlit-authenticator can consume without issues
+# AUTHENTICATION
 # --------------------------------------------------
-# --------------------------------------------------
-# LOAD AUTH CONFIG FROM STREAMLIT SECRETS
-# --------------------------------------------------
-import streamlit as st
+auth_config_path = os.path.join(ROOT_DIR, "auth_config.yaml")
 
-try:
-    auth_cfg = st.secrets["auth_config"]
-except Exception:
-    # fallback for local dev
-    auth_cfg = {
-        "credentials": {"usernames": {}},
-        "cookie": {"name": "atom_auth", "expiry_days": 30},
-    }
-# Ensure nested keys exist with safe defaults
-auth_cfg.setdefault("credentials", {"usernames": {}})
-auth_cfg.setdefault("cookie", {"name": "atom_auth", "expiry_days": 30})
 
+def _load_auth_cfg():
+    def deep_convert(obj):
+        if hasattr(obj, "to_dict"):
+            return deep_convert(obj.to_dict())
+        elif hasattr(obj, "_asdict"):
+            return deep_convert(obj._asdict())
+        elif isinstance(obj, dict):
+            return {k: deep_convert(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [deep_convert(i) for i in obj]
+        else:
+            return str(obj) if not isinstance(obj, (int, float, bool, type(None))) else obj
+
+    if "auth_config" in st.secrets:
+        return deep_convert(st.secrets["auth_config"])
+
+    if os.path.exists(auth_config_path):
+        with open(auth_config_path, encoding="utf-8") as f:
+            return yaml.load(f, Loader=SafeLoader)
+
+    raise ValueError("auth_config not found in secrets or yaml")
+
+
+auth_cfg = _load_auth_cfg()
 
 authenticator = stauth.Authenticate(
     auth_cfg["credentials"],
@@ -256,9 +98,6 @@ authenticator = stauth.Authenticate(
     auth_cfg["cookie"]["expiry_days"],
 )
 
-# --------------------------------------------------
-# Guest mode: login is optional
-# --------------------------------------------------
 is_logged_in = st.session_state.get("authentication_status") is True
 username     = st.session_state.get("username", "guest")
 user_name    = st.session_state.get("name",     "Guest")
@@ -266,24 +105,27 @@ user_name    = st.session_state.get("name",     "Guest")
 # --------------------------------------------------
 # Session State
 # --------------------------------------------------
-if "show_intro"        not in st.session_state: st.session_state.show_intro        = True
-if "show_auth_modal"   not in st.session_state: st.session_state.show_auth_modal   = False
-if "active_agent"      not in st.session_state: st.session_state.active_agent      = "Finance Planner"
-if "answer_style"      not in st.session_state: st.session_state.answer_style      = "Detailed"
-if "rag_agent"         not in st.session_state: st.session_state.rag_agent         = None
-if "rag_ready"         not in st.session_state: st.session_state.rag_ready         = False
-if "data_agent"        not in st.session_state: st.session_state.data_agent        = None
-if "data_loaded"       not in st.session_state: st.session_state.data_loaded       = False
-if "da_fig"            not in st.session_state: st.session_state.da_fig            = None
-if "da_answer"         not in st.session_state: st.session_state.da_answer         = None
-if "da_plan"           not in st.session_state: st.session_state.da_plan           = None
-if "da_chart_override" not in st.session_state: st.session_state.da_chart_override = None
-if "da_palette"        not in st.session_state: st.session_state.da_palette        = "Default"
-if "da_single_color"   not in st.session_state: st.session_state.da_single_color   = "#4f8ef7"
-if "da_use_palette"    not in st.session_state: st.session_state.da_use_palette    = True
-if "da_source_names"   not in st.session_state: st.session_state.da_source_names   = []
+if "show_intro"          not in st.session_state: st.session_state.show_intro          = True
+if "show_auth_modal"     not in st.session_state: st.session_state.show_auth_modal     = False
+if "show_reset_flow"     not in st.session_state: st.session_state.show_reset_flow     = False
+if "reset_token_ss"      not in st.session_state: st.session_state.reset_token_ss      = ""
+if "active_agent"        not in st.session_state: st.session_state.active_agent        = "⚛️ ATOM AI OS"
+if "answer_style"        not in st.session_state: st.session_state.answer_style        = "Detailed"
+if "rag_agent"           not in st.session_state: st.session_state.rag_agent           = None
+if "rag_ready"           not in st.session_state: st.session_state.rag_ready           = False
+if "data_agent"          not in st.session_state: st.session_state.data_agent          = None
+if "data_loaded"         not in st.session_state: st.session_state.data_loaded         = False
+if "da_fig"              not in st.session_state: st.session_state.da_fig              = None
+if "da_answer"           not in st.session_state: st.session_state.da_answer           = None
+if "da_plan"             not in st.session_state: st.session_state.da_plan             = None
+if "da_chart_override"   not in st.session_state: st.session_state.da_chart_override   = None
+if "da_palette"          not in st.session_state: st.session_state.da_palette          = "Default"
+if "da_single_color"     not in st.session_state: st.session_state.da_single_color     = "#4f8ef7"
+if "da_use_palette"      not in st.session_state: st.session_state.da_use_palette      = True
+if "da_source_names"     not in st.session_state: st.session_state.da_source_names     = []
+if "workspace_messages"  not in st.session_state: st.session_state.workspace_messages  = []
+if "user_rag_messages"   not in st.session_state: st.session_state.user_rag_messages   = []
 
-# Load chat histories from DB (only for logged-in users)
 if "finance_messages" not in st.session_state:
     rows = get_finance_history(username) if is_logged_in else []
     st.session_state.finance_messages = [{"role": r["role"], "content": r["content"]} for r in rows]
@@ -301,34 +143,20 @@ if "da_history" not in st.session_state:
 with st.sidebar:
     st.title("ATOM")
 
-    if is_logged_in:
-        st.markdown(
-            f"<div style='background:#f0f0f5;border-radius:8px;padding:8px 12px;"
-            f"margin-bottom:4px;'>"
-            f"<span style='color:#555;font-size:12px;'>Signed in as</span><br>"
-            f"<span style='color:#111;font-weight:600;font-size:14px;'>{user_name}</span>"
-            f"<span style='color:#888;font-size:12px;'> · {username}</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-    else:
-        st.markdown(
-            "<div style='background:#fff8e1;border-radius:8px;padding:8px 12px;"
-            "margin-bottom:4px;border:1px solid #ffe082;'>"
-            "<span style='color:#888;font-size:12px;'>Browsing as</span><br>"
-            "<span style='color:#111;font-weight:600;font-size:14px;'>Guest</span>"
-            "<span style='color:#888;font-size:12px;'> · History not saved</span>"
-            "</div>",
-            unsafe_allow_html=True
-        )
+    # ── User status badge ─────────────────────────────────────────────────
+    sidebar_user_badge(is_logged_in, user_name, username)
+
+    if not is_logged_in:
         if st.button("🔑 Sign In / Sign Up", use_container_width=True):
             st.session_state.show_auth_modal = True
             st.rerun()
+
     st.divider()
 
+    # ── Agent selector ────────────────────────────────────────────────────
     st.session_state.active_agent = st.radio(
         "Choose Agent",
-        ["Finance Planner", "Stock Market RAG", "Data Analyst"]
+        ["⚛️ ATOM AI OS", "Finance Planner", "Stock Market RAG", "Data Analyst", "My Documents"],
     )
 
     if st.session_state.active_agent == "Stock Market RAG":
@@ -340,6 +168,11 @@ with st.sidebar:
     if st.button("🏠 Go to Home"):
         st.session_state.show_intro = True
         st.rerun()
+
+    if st.session_state.active_agent == "⚛️ ATOM AI OS":
+        if st.button("🗑 Clear AI OS Chat"):
+            st.session_state.workspace_messages = []
+            st.rerun()
 
     if st.session_state.active_agent == "Finance Planner":
         if st.button("🗑 Clear Finance Chat"):
@@ -356,15 +189,16 @@ with st.sidebar:
     if st.session_state.active_agent == "Data Analyst":
         if st.button("🗑 Clear Analysis History"):
             if is_logged_in: delete_analysis_history(username)
-            st.session_state.da_history        = []
-            st.session_state.da_fig            = None
-            st.session_state.da_answer         = None
-            st.session_state.da_plan           = None
+            st.session_state.da_history      = []
+            st.session_state.da_fig          = None
+            st.session_state.da_answer       = None
+            st.session_state.da_plan         = None
             st.session_state.da_chart_override = None
             st.rerun()
 
     st.divider()
 
+    # ── Token usage gauge ─────────────────────────────────────────────────
     usage = get_usage_stats()
     pct   = min(int(usage["tokens_last_minute"] / usage["warn_threshold"] * 100), 100)
     st.caption("🔢 API token usage (last 60s)")
@@ -376,14 +210,60 @@ with st.sidebar:
         authenticator.logout("🚪 Logout", location="sidebar")
 
 # --------------------------------------------------
-# AUTH MODAL (login / sign-up overlay)
+# PASSWORD RESET (URL token)
+# --------------------------------------------------
+if _reset_token_url:
+    st.session_state.reset_token_ss  = _reset_token_url
+    st.session_state.show_reset_flow = True
+    st.query_params.clear()
+
+if st.session_state.get("show_reset_flow") and st.session_state.get("reset_token_ss"):
+
+    token = st.session_state.reset_token_ss
+    valid, reset_username, err = validate_reset_token(token)
+
+    st.markdown("---")
+    st.markdown("### 🔑 Set New Password")
+
+    if not valid:
+        st.error(err)
+        if st.button("Back to Sign In"):
+            st.session_state.show_reset_flow = False
+            st.session_state.reset_token_ss  = ""
+            st.session_state.show_auth_modal = True
+            st.rerun()
+    else:
+        st.success(f"Link verified for **{reset_username}**. Choose a new password.")
+        np1 = st.text_input("New password",     type="password", key="np1")
+        np2 = st.text_input("Confirm password", type="password", key="np2")
+
+        if st.button("Save New Password", use_container_width=True):
+            if not np1 or not np2:
+                st.error("Please fill in both fields.")
+            elif np1 != np2:
+                st.error("Passwords do not match.")
+            else:
+                ok, err2 = apply_new_password(token, np1, auth_cfg, auth_config_path)
+                if ok:
+                    st.success("✅ Password updated! You can now sign in.")
+                    st.session_state.show_reset_flow = False
+                    st.session_state.reset_token_ss  = ""
+                    st.session_state.show_auth_modal = True
+                else:
+                    st.error(err2)
+
+    st.markdown("---")
+    st.stop()
+
+# --------------------------------------------------
+# AUTH MODAL
 # --------------------------------------------------
 if st.session_state.get("show_auth_modal") and not is_logged_in:
 
     st.markdown("---")
     st.markdown("### 🔐 Account")
 
-    login_tab, signup_tab = st.tabs(["Sign In", "Sign Up"])
+    login_tab, signup_tab, forgot_tab = st.tabs(["Sign In", "Sign Up", "Forgot Password"])
 
     with login_tab:
         authenticator.login(location="main")
@@ -405,11 +285,11 @@ if st.session_state.get("show_auth_modal") and not is_logged_in:
 
     with signup_tab:
         st.markdown("Create a new account:")
-        new_username  = st.text_input("Choose a username",  key="reg_username")
-        new_name      = st.text_input("Your display name",  key="reg_name")
-        new_email     = st.text_input("Email address",      key="reg_email")
-        new_password  = st.text_input("Choose a password",  type="password", key="reg_pass1")
-        confirm_pass  = st.text_input("Confirm password",   type="password", key="reg_pass2")
+        new_username = st.text_input("Choose a username", key="reg_username")
+        new_name     = st.text_input("Your display name", key="reg_name")
+        new_email    = st.text_input("Email address",     key="reg_email")
+        new_password = st.text_input("Choose a password", type="password", key="reg_pass1")
+        confirm_pass = st.text_input("Confirm password",  type="password", key="reg_pass2")
 
         if st.button("Create Account", use_container_width=True):
             if not all([new_username, new_name, new_email, new_password, confirm_pass]):
@@ -428,11 +308,37 @@ if st.session_state.get("show_auth_modal") and not is_logged_in:
                     "name":     new_name,
                     "password": hashed,
                 }
-                # Write back to secrets.toml
-            
-                st.warning("⚠️ Signup is disabled in deployed version (read-only environment).")
-                
+                with open(auth_config_path, "w", encoding="utf-8") as yf:
+                    yaml.dump(auth_cfg, yf, default_flow_style=False, allow_unicode=True)
                 st.success(f"Account created! You can now sign in as **{new_username}**.")
+
+    with forgot_tab:
+        st.markdown("Enter the email address linked to your account:")
+        reset_email = st.text_input("Email address", key="reset_email_input")
+        app_url     = st.text_input(
+            "App URL (for the reset link)",
+            value="http://localhost:8501",
+            key="reset_app_url",
+            help="Change this to your deployed URL if using Streamlit Cloud",
+        )
+
+        if st.button("Send Reset Link", use_container_width=True):
+            if not reset_email.strip():
+                st.error("Please enter your email address.")
+            else:
+                with st.spinner("Sending reset email..."):
+                    ok, err = generate_reset_token(
+                        email        = reset_email.strip(),
+                        auth_cfg     = auth_cfg,
+                        app_base_url = app_url.strip().rstrip("/"),
+                    )
+                if ok:
+                    st.success(
+                        "✅ If that email is registered, a reset link has been sent. "
+                        "Check your inbox — the link expires in 15 minutes."
+                    )
+                else:
+                    st.error(f"Could not send email: {err}")
 
     if st.button("✕ Cancel", key="close_auth"):
         st.session_state.show_auth_modal = False
@@ -448,31 +354,75 @@ if st.session_state.show_intro:
 
     st.markdown("<br><br>", unsafe_allow_html=True)
     st.markdown(
-        "<h1 style='text-align:center; font-size:64px; color:#111;'>ATOM</h1>",
-        unsafe_allow_html=True
+        "<h1 style='text-align:center;font-size:72px;font-family:var(--font-display);"
+        "background:linear-gradient(90deg,#fff 0%,#a5b4fc 50%,#818cf8 100%);"
+        "background-size:200%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;"
+        "animation:titleSlide 5s linear infinite;display:inline-block;width:100%;'>"
+        "ATOM</h1>",
+        unsafe_allow_html=True,
     )
     st.markdown(
-        f"<p style='text-align:center; font-size:20px; color:#555;'>"
-        f"Welcome back, <strong>{user_name}</strong></p>",
-        unsafe_allow_html=True
+        f"<p style='text-align:center;font-size:20px;color:var(--text-secondary);"
+        f"font-family:var(--font-body);'>"
+        f"Welcome back, <strong style='color:var(--accent-text);'>{user_name}</strong></p>",
+        unsafe_allow_html=True,
     )
-    st.markdown(
-        "<p style='text-align:center; font-size:18px; color:#888;'>"
-        "A Multi-Agent AI Platform for Finance & Intelligence"
-        "</p>",
-        unsafe_allow_html=True
-    )
+    
+    st.markdown("""
+<div style='text-align:center;margin-bottom:8px;'>
+  <span id='typewriter'
+    style='font-size:18px;color:var(--accent-text);font-family:var(--font-body);
+           font-weight:400;letter-spacing:0.3px;'></span>
+  <span style='color:var(--accent);animation:atomCursor 0.75s step-end infinite;
+               font-weight:300;'>|</span>
+</div>
+
+<script>
+const phrases = [
+  "Your AI OS is live.",
+  "Search. Reason. Create.",
+  "Intelligence, on demand.",
+  "Built for what's next."
+];
+let pi = 0, ci = 0, deleting = false;
+const el = document.getElementById('typewriter');
+
+function type() {
+  const phrase = phrases[pi];
+  if (!deleting) {
+    el.textContent = phrase.slice(0, ++ci);
+    if (ci === phrase.length) { deleting = true; setTimeout(type, 1800); return; }
+  } else {
+    el.textContent = phrase.slice(0, --ci);
+    if (ci === 0) { deleting = false; pi = (pi + 1) % phrases.length; }
+  }
+  setTimeout(type, deleting ? 45 : 80);
+}
+type();
+</script>
+""", unsafe_allow_html=True)
+
     st.markdown("<br>", unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.markdown("<h3 style='color:#111;'>Features</h3>", unsafe_allow_html=True)
-        st.markdown("""
-- 💸 Smart Finance Planning
-- 📈 Market & Stock Intelligence
-- 📚 RBI & SEBI Document AI Search
-- 📊 Autonomous Data Analytics
-        """)
+        st.markdown(
+            "<h3 style='color:var(--text-primary);font-family:var(--font-display);'>"
+            "Features</h3>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<ul style='color:var(--text-secondary);font-family:var(--font-body);"
+            "line-height:2;font-size:15px;'>"
+            "<li>⚛️ Universal AI Workspace</li>"
+            "<li>🔍 Live Web Search &amp; Accurate Answers</li>"
+            "<li>💻 Coding, Writing &amp; Research Help</li>"
+            "<li>📊 Autonomous Data Analytics</li>"
+            "<li>📂 Private Document Intelligence</li>"
+            "<li>🏦 Finance Specialist Tools</li>"
+            "</ul>",
+            unsafe_allow_html=True,
+        )
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Enter Platform", use_container_width=True):
             st.session_state.show_intro = False
@@ -481,11 +431,107 @@ if st.session_state.show_intro:
     st.stop()
 
 # --------------------------------------------------
+# ⚛️ ATOM AI OS — General Intelligence Workspace
+# --------------------------------------------------
+if st.session_state.active_agent == "⚛️ ATOM AI OS":
+
+    page_title("⚛️ ATOM AI OS", "Ask anything · Web search · Code · Writing · Research")
+    capability_chips(["🔍 Live Search", "💻 Code Help", "✍️ Writing", "📚 Research", "🧠 Reasoning"])
+
+    # ── Chat history ──────────────────────────────────────────────────────
+    for msg in st.session_state.workspace_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+            if msg["role"] == "assistant" and msg.get("sources"):
+                with st.expander(f"🔍 {len(msg['sources'])} web source(s) used", expanded=False):
+                    for src in msg["sources"]:
+                        title = src.get("title", "Source")
+                        url   = src.get("url",   "")
+                        date  = src.get("published_date", "")
+                        if url:
+                            st.markdown(f"**[{title}]({url})**" + (f" · {date}" if date else ""))
+                        elif title:
+                            st.markdown(f"**{title}**" + (f" · {date}" if date else ""))
+
+            if msg["role"] == "assistant" and msg.get("mode"):
+                mode_icon  = "🔍" if msg["mode"] == "search" else "🧠"
+                mode_label = "Web Search + AI" if msg["mode"] == "search" else "Direct AI Reasoning"
+                st.caption(f"{mode_icon} {mode_label}")
+
+    # ── Suggested prompts (empty state) ──────────────────────────────────
+    if not st.session_state.workspace_messages:
+        st.markdown("---")
+        st.markdown(
+            "<p style='color:var(--text-tertiary);font-size:13px;"
+            "font-family:var(--font-body);'>Try asking:</p>",
+            unsafe_allow_html=True,
+        )
+        suggestion_cols = st.columns(2)
+        suggestions = [
+            ("🏏", "IPL 2025 points table"),
+            ("🤖", "Latest AI tools in 2026"),
+            ("💻", "Fix this Python error: list index out of range"),
+            ("📝", "Write a LinkedIn post about joining a new job"),
+            ("📊", "Best laptops under ₹60,000 in 2026"),
+            ("🔬", "Explain how transformers work in simple terms"),
+        ]
+        for i, (icon, suggestion) in enumerate(suggestions):
+            with suggestion_cols[i % 2]:
+                if st.button(f"{icon} {suggestion}", key=f"ws_suggestion_{i}", use_container_width=True):
+                    st.session_state._workspace_inject = suggestion
+                    st.rerun()
+        st.markdown("---")
+
+    injected = st.session_state.pop("_workspace_inject", None)
+    query    = st.chat_input("Ask anything…") or injected
+
+    if query:
+        st.session_state.workspace_messages.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.markdown(query)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                result = run_workspace_agent(
+                    query        = query,
+                    chat_history = st.session_state.workspace_messages,
+                )
+            answer  = result["answer"]
+            mode    = result["mode"]
+            sources = result["sources"]
+
+            st.markdown(answer)
+
+            if sources:
+                with st.expander(f"🔍 {len(sources)} web source(s) used", expanded=False):
+                    for src in sources:
+                        title = src.get("title", "Source")
+                        url   = src.get("url",   "")
+                        date  = src.get("published_date", "")
+                        if url:
+                            st.markdown(f"**[{title}]({url})**" + (f" · {date}" if date else ""))
+                        elif title:
+                            st.markdown(f"**{title}**")
+
+            mode_icon  = "🔍" if mode == "search" else "🧠"
+            mode_label = "Web Search + AI" if mode == "search" else "Direct AI Reasoning"
+            st.caption(f"{mode_icon} {mode_label}")
+
+        st.session_state.workspace_messages.append({
+            "role":    "assistant",
+            "content": answer,
+            "mode":    mode,
+            "sources": sources,
+        })
+        st.rerun()
+
+# --------------------------------------------------
 # FINANCE AGENT
 # --------------------------------------------------
-if st.session_state.active_agent == "Finance Planner":
+elif st.session_state.active_agent == "Finance Planner":
 
-    st.markdown("<h2 style='color:#111;'>AI Finance Planner</h2>", unsafe_allow_html=True)
+    page_title("AI Finance Planner", "Smart money, smarter decisions")
 
     for msg in st.session_state.finance_messages:
         with st.chat_message(msg["role"]):
@@ -511,7 +557,7 @@ if st.session_state.active_agent == "Finance Planner":
 # --------------------------------------------------
 elif st.session_state.active_agent == "Stock Market RAG":
 
-    st.markdown("<h2 style='color:#111;'>Stock Market RAG Agent</h2>", unsafe_allow_html=True)
+    page_title("Stock Market RAG", "RBI & SEBI document intelligence")
 
     if not st.session_state.rag_ready:
         with st.spinner("Indexing documents..."):
@@ -554,15 +600,8 @@ elif st.session_state.active_agent == "Stock Market RAG":
 # --------------------------------------------------
 elif st.session_state.active_agent == "Data Analyst":
 
-    st.markdown("<h2 style='color:#111;'>AI Data Analyst</h2>", unsafe_allow_html=True)
-    st.markdown(
-        "<p style='color:#666; font-size:14px;'>"
-        "Upload CSV or Excel · Explore data · Ask questions · Customise charts"
-        "</p>",
-        unsafe_allow_html=True
-    )
+    page_title("AI Data Analyst", "Upload CSV or Excel · Explore · Ask · Visualize")
 
-    # ── Upload ─────────────────────────────────────────────────────────────
     uploaded_files = st.file_uploader(
         "Upload CSV or Excel files (multiple supported)",
         type=["csv", "xlsx", "xls"],
@@ -605,14 +644,11 @@ elif st.session_state.active_agent == "Data Analyst":
     if not st.session_state.data_loaded:
         st.stop()
 
-    # ── Tabs ───────────────────────────────────────────────────────────────
     tab_summary, tab_analyse, tab_history = st.tabs(
         ["📋 Data Summary", "🤖 Ask AI", "📜 History"]
     )
 
-    # ══════════════════════════════
-    # TAB 1 — SUMMARY
-    # ══════════════════════════════
+    # ── TAB 1: SUMMARY ────────────────────────────────────────────────────
     with tab_summary:
         summary = st.session_state.data_agent.get_data_summary()
 
@@ -644,13 +680,11 @@ elif st.session_state.active_agent == "Data Analyst":
         n_rows = st.slider("Rows to show", min_value=5, max_value=100, value=10, step=5)
         st.dataframe(st.session_state.data_agent.df.head(n_rows), use_container_width=True)
 
-    # ══════════════════════════════
-    # TAB 2 — ASK AI
-    # ══════════════════════════════
+    # ── TAB 2: ASK AI ─────────────────────────────────────────────────────
     with tab_analyse:
         question = st.text_input(
             "Ask about your dataset",
-            placeholder="e.g. show the trend of revenue by month"
+            placeholder="e.g. show the trend of revenue by month",
         )
 
         if st.button("Analyze") and question.strip():
@@ -667,13 +701,9 @@ elif st.session_state.active_agent == "Data Analyst":
             st.session_state.da_chart_override = plan.get("chart")
             st.session_state.da_use_palette    = True
 
-            active_src = (
-                st.session_state.da_source_names[-1]
-                if st.session_state.da_source_names else None
-            )
+            active_src = st.session_state.da_source_names[-1] if st.session_state.da_source_names else None
             if is_logged_in:
-                save_analysis(username=username, question=question,
-                              answer=answer, plan=plan, dataset=active_src)
+                save_analysis(username=username, question=question, answer=answer, plan=plan, dataset=active_src)
                 st.session_state.da_history = get_analysis_history(username, limit=50)
 
         if st.session_state.da_fig is not None and st.session_state.da_plan is not None:
@@ -694,16 +724,16 @@ elif st.session_state.active_agent == "Data Analyst":
 
                 selected_label = st.selectbox(
                     "Chart Type", options=chart_labels, index=current_idx,
-                    help="Switch without re-running AI"
+                    help="Switch without re-running AI",
                 )
                 selected_chart = chart_options[chart_labels.index(selected_label)]
 
                 st.markdown("---")
                 st.markdown("**🎨 Colour**")
-                color_mode = st.radio(
+                color_mode  = st.radio(
                     "mode", ["Palette", "Single colour"],
                     index=0 if st.session_state.da_use_palette else 1,
-                    label_visibility="collapsed"
+                    label_visibility="collapsed",
                 )
                 use_palette = color_mode == "Palette"
 
@@ -711,9 +741,7 @@ elif st.session_state.active_agent == "Data Analyst":
                     palette = st.selectbox(
                         "Palette",
                         options=list(DataAnalystAgent.COLOR_PALETTES.keys()),
-                        index=list(DataAnalystAgent.COLOR_PALETTES.keys()).index(
-                            st.session_state.da_palette
-                        ),
+                        index=list(DataAnalystAgent.COLOR_PALETTES.keys()).index(st.session_state.da_palette),
                     )
                     single_color = None
                 else:
@@ -752,7 +780,7 @@ elif st.session_state.active_agent == "Data Analyst":
                             "height": 600, "width": 1000, "scale": 2,
                         },
                         "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
-                    }
+                    },
                 )
                 plan = st.session_state.da_plan
                 st.caption(
@@ -762,9 +790,7 @@ elif st.session_state.active_agent == "Data Analyst":
                     f"Agg: **{plan.get('agg_func') or '—'}**"
                 )
 
-    # ══════════════════════════════
-    # TAB 3 — HISTORY
-    # ══════════════════════════════
+    # ── TAB 3: HISTORY ────────────────────────────────────────────────────
     with tab_history:
         history = st.session_state.da_history
 
@@ -776,7 +802,7 @@ elif st.session_state.active_agent == "Data Analyst":
             for item in history:
                 with st.expander(
                     f"🕐 {item['created_at']}  ·  {item['question'][:80]}",
-                    expanded=False
+                    expanded=False,
                 ):
                     c1, c2 = st.columns([3, 1])
                     with c1:
@@ -786,3 +812,126 @@ elif st.session_state.active_agent == "Data Analyst":
                         st.caption(f"📊 Chart: **{item.get('chart_type') or '—'}**")
                         if item.get("dataset"):
                             st.caption(f"📁 {item['dataset']}")
+
+# --------------------------------------------------
+# MY DOCUMENTS AGENT
+# --------------------------------------------------
+elif st.session_state.active_agent == "My Documents":
+
+    page_title("My Documents", "Private document AI · Upload · Ask · Get cited answers")
+
+    if not is_logged_in:
+        st.warning(
+            "📂 Please sign in to use My Documents. "
+            "Your documents are stored privately per account."
+        )
+        if st.button("🔑 Sign In / Sign Up"):
+            st.session_state.show_auth_modal = True
+            st.rerun()
+        st.stop()
+
+    doc_col, chat_col = st.columns([1, 2])
+
+    # ── LEFT: Document Manager ────────────────────────────────────────────
+    with doc_col:
+        st.markdown("#### 📁 Your Documents")
+
+        uploaded = st.file_uploader(
+            "Upload a file",
+            type=["pdf", "docx", "txt", "csv"],
+            help="PDF, Word, plain text, or CSV. Stored privately.",
+            key="user_rag_uploader",
+        )
+
+        if uploaded:
+            file_bytes = uploaded.read()
+            with st.spinner(f"Indexing {uploaded.name}…"):
+                result = upload_document(username, file_bytes, uploaded.name)
+
+            if result["success"]:
+                st.success(
+                    "✅ **" + result["filename"] + "** indexed — "
+                    + str(result["pages"]) + " pages · "
+                    + str(result["chunks"]) + " chunks"
+                )
+            else:
+                st.error(f"❌ {result['message']}")
+
+        st.markdown("---")
+
+        user_docs = get_user_documents(username)
+
+        if not user_docs:
+            st.info("No documents yet. Upload a file above.")
+        else:
+            st.markdown(f"**{len(user_docs)} document(s)**")
+            for fname, fmeta in user_docs.items():
+                with st.expander(f"📄 {fname}", expanded=False):
+                    st.caption(
+                        f"Type: {fmeta.get('file_type','?').upper()}  ·  "
+                        f"{fmeta.get('pages','?')} pages  ·  "
+                        f"{fmeta.get('size_kb','?')} KB"
+                    )
+                    st.caption(f"Uploaded: {fmeta.get('uploaded_at','?')[:10]}")
+
+                    if st.button("🗑 Delete", key=f"del_{fname}"):
+                        result = delete_document(username, fname)
+                        if result["success"]:
+                            st.success(result["message"])
+                            st.rerun()
+                        else:
+                            st.error(result["message"])
+
+    # ── RIGHT: Chat ───────────────────────────────────────────────────────
+    with chat_col:
+        st.markdown("#### 💬 Ask About Your Documents")
+
+        for msg in st.session_state.user_rag_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+                if msg.get("sources"):
+                    with st.expander("📎 Sources", expanded=False):
+                        for src in msg["sources"]:
+                            st.caption(f"**{src['filename']}** · Page {src['page']}")
+                            if src.get("excerpt"):
+                                st.caption(f"*…{src['excerpt']}…*")
+
+        if query := st.chat_input("Ask about your uploaded documents…"):
+            st.session_state.user_rag_messages.append({"role": "user", "content": query})
+            with st.chat_message("user"):
+                st.markdown(query)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Searching your documents…"):
+                    result = user_rag_ask(
+                        username     = username,
+                        question     = query,
+                        chat_history = st.session_state.user_rag_messages,
+                    )
+
+                answer  = result["answer"]
+                sources = result["sources"]
+
+                st.markdown(answer)
+
+                if sources:
+                    with st.expander(f"📎 {len(sources)} source(s) used", expanded=True):
+                        for src in sources:
+                            st.markdown(f"**{src['filename']}** · Page {src['page']}")
+                            if src.get("excerpt"):
+                                st.caption(f"*{src['excerpt']}*")
+                            st.markdown("---")
+
+            st.session_state.user_rag_messages.append({
+                "role":    "assistant",
+                "content": answer,
+                "sources": sources,
+            })
+            st.rerun()
+
+        if st.session_state.user_rag_messages:
+            if st.button("🗑 Clear Chat", key="clear_user_rag_chat"):
+                st.session_state.user_rag_messages = []
+                st.rerun()
+               
