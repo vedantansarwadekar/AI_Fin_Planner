@@ -31,7 +31,6 @@ from src.database import (
 )
 from src.llm import get_usage_stats
 from src.password_reset import generate_reset_token, validate_reset_token, apply_new_password
-from src.config import AUTH_COOKIE_SECRET
 from src.user_docs import (
     upload_document,
     get_user_documents,
@@ -72,21 +71,21 @@ auth_config_path = os.path.join(ROOT_DIR, "auth_config.yaml")
 
 
 def _load_auth_cfg():
-    def deep_convert(obj):
-        if hasattr(obj, "to_dict"):
-            return deep_convert(obj.to_dict())
-        elif hasattr(obj, "_asdict"):
-            return deep_convert(obj._asdict())
-        elif isinstance(obj, dict):
-            return {k: deep_convert(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [deep_convert(i) for i in obj]
-        else:
-            return str(obj) if not isinstance(obj, (int, float, bool, type(None))) else obj
+    # On Streamlit Cloud — secrets have [cookie] and [credentials] directly
+    if "cookie" in st.secrets and "credentials" in st.secrets:
+        return {
+            "cookie": {
+                "name":        st.secrets["cookie"]["name"],
+                "key":         st.secrets["cookie"]["key"],
+                "expiry_days": st.secrets["cookie"]["expiry_days"],
+            },
+            "credentials": st.secrets["credentials"].to_dict(),
+            "preauthorized": st.secrets.get("preauthorized", {"emails": []}).to_dict()
+            if hasattr(st.secrets.get("preauthorized", {}), "to_dict")
+            else st.secrets.get("preauthorized", {"emails": []}),
+        }
 
-    if "auth_config" in st.secrets:
-        return deep_convert(st.secrets["auth_config"])
-
+    # Local — read from yaml file
     if os.path.exists(auth_config_path):
         with open(auth_config_path, encoding="utf-8") as f:
             return yaml.load(f, Loader=SafeLoader)
@@ -99,7 +98,7 @@ auth_cfg = _load_auth_cfg()
 authenticator = stauth.Authenticate(
     auth_cfg["credentials"],
     auth_cfg["cookie"]["name"],
-    AUTH_COOKIE_SECRET,
+    st.secrets.get("AUTH_COOKIE_SECRET", "myatomsecretkey2024changethis"),
     auth_cfg["cookie"]["expiry_days"],
 )
 
