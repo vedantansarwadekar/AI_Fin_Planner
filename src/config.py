@@ -20,20 +20,20 @@ try:
 except (ImportError, RuntimeError):
     HAS_STREAMLIT = False
 
-# API Keys - Try Streamlit secrets first, then .env
 def get_secret(key, default=None):
-    """Get secret from Streamlit secrets (cloud) or environment (local)"""
-    # Try environment variable first (works everywhere)
+    # Try Streamlit secrets FIRST (cloud deployment)
+    if HAS_STREAMLIT:
+        try:
+            val = st.secrets.get(key)
+            if val:
+                return val
+        except Exception:
+            pass
+    
+    # Fall back to .env (local)
     env_val = os.getenv(key)
     if env_val:
         return env_val
-    
-    # Try Streamlit secrets (cloud deployment)
-    if HAS_STREAMLIT:
-        try:
-            return st.secrets.get(key)
-        except Exception:
-            pass
     
     return default
 
