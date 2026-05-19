@@ -1,0 +1,18 @@
+cookie:
+  expiry_days: 30
+  key: random_key
+  name: auth_cookie
+
+credentials:
+  usernames:
+    dummy:
+      email: vedant.ansarwadekar@gmail.com
+      name: dummy
+      password: "$2b$12$B1HanfTQH3xIX4Ds3Tqjh.yVOXuM2rFPB4s5v997XetClvgTBGGjG"
+
+    vedant:
+      name: Vedant
+      password: "$2b$12$1JCS8lLt.g0EpUREqw7hoesGMELgQ2bGTrELceq8wJJOx67mO70PS"
+
+preauthorized:
+  emails: []
