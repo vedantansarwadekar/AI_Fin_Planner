@@ -4,6 +4,7 @@ import glob
 import yaml
 import streamlit as st
 import pandas as pd
+import streamlit.components.v1 as components
 import streamlit_authenticator as stauth
 from yaml.loader import SafeLoader
 
@@ -18,6 +19,10 @@ from src.agents.workspace_agent import run_workspace_agent
 from src.agents.finance_agent import run_finance_agent
 from src.agents.rag_agent import StockMarketRAGAgent
 from src.agents.data_agent import DataAnalystAgent
+from src.agents.router_agent import (
+    classify_query, build_routing_message,
+    suggest_upload_agent, AGENT_META,
+)
 from src.database import (
     init_db,
     save_analysis, get_analysis_history, delete_analysis_history,
@@ -100,7 +105,7 @@ authenticator = stauth.Authenticate(
 
 is_logged_in = st.session_state.get("authentication_status") is True
 username     = st.session_state.get("username", "guest")
-user_name    = st.session_state.get("name",     "Guest")
+user_name    = st.session_state.get("name") or "Guest"
 
 # --------------------------------------------------
 # Session State
@@ -110,6 +115,7 @@ if "show_auth_modal"     not in st.session_state: st.session_state.show_auth_mod
 if "show_reset_flow"     not in st.session_state: st.session_state.show_reset_flow     = False
 if "reset_token_ss"      not in st.session_state: st.session_state.reset_token_ss      = ""
 if "active_agent"        not in st.session_state: st.session_state.active_agent        = "⚛️ ATOM AI OS"
+if "auto_mode"           not in st.session_state: st.session_state.auto_mode           = False
 if "answer_style"        not in st.session_state: st.session_state.answer_style        = "Detailed"
 if "rag_agent"           not in st.session_state: st.session_state.rag_agent           = None
 if "rag_ready"           not in st.session_state: st.session_state.rag_ready           = False
@@ -125,6 +131,11 @@ if "da_use_palette"      not in st.session_state: st.session_state.da_use_palett
 if "da_source_names"     not in st.session_state: st.session_state.da_source_names     = []
 if "workspace_messages"  not in st.session_state: st.session_state.workspace_messages  = []
 if "user_rag_messages"   not in st.session_state: st.session_state.user_rag_messages   = []
+if "auto_messages"       not in st.session_state: st.session_state.auto_messages       = []
+if "auto_pending_query"  not in st.session_state: st.session_state.auto_pending_query  = None
+if "auto_pending_route"  not in st.session_state: st.session_state.auto_pending_route  = None
+if "auto_awaiting_conf"  not in st.session_state: st.session_state.auto_awaiting_conf  = False
+if "auto_pending_upload" not in st.session_state: st.session_state.auto_pending_upload = None
 
 if "finance_messages" not in st.session_state:
     rows = get_finance_history(username) if is_logged_in else []
@@ -137,11 +148,102 @@ if "rag_messages" not in st.session_state:
 if "da_history" not in st.session_state:
     st.session_state.da_history = get_analysis_history(username, limit=50) if is_logged_in else []
 
+
+# --------------------------------------------------
+# Helper: run the correct agent given a key
+# --------------------------------------------------
+def _run_agent(agent_key: str, query: str) -> str:
+    """Run the appropriate agent and return a text response."""
+    if agent_key == "ai_os":
+        result = run_workspace_agent(query=query, chat_history=st.session_state.auto_messages)
+        return result["answer"]
+
+    elif agent_key == "finance":
+        try:
+            return run_finance_agent(query, chat_history=st.session_state.auto_messages)
+        except RuntimeError as e:
+            return f"⚠️ {e}"
+
+    elif agent_key == "stock_rag":
+        if not st.session_state.rag_ready:
+            return "⚠️ Stock Market RAG index isn't built yet. Switch to Stock Market RAG tab first to index documents."
+        try:
+            result = st.session_state.rag_agent.ask(query, answer_style="Detailed")
+            answer = result["answer"]
+            if result.get("sources"):
+                answer += "\n\n**Sources:** " + " · ".join(
+                    f"{s['source']} p.{s['page']}" for s in result["sources"]
+                )
+            return answer
+        except RuntimeError as e:
+            return f"⚠️ {e}"
+
+    elif agent_key == "data_analyst":
+        if not st.session_state.data_loaded:
+            return "⚠️ No dataset loaded. Please upload a CSV or Excel file in the Data Analyst tab first."
+        try:
+            fig, answer, plan = st.session_state.data_agent.analyze(query)
+            st.session_state.da_fig    = fig
+            st.session_state.da_plan   = plan
+            st.session_state.da_answer = answer
+            return answer + "\n\n_📊 Chart generated — switch to Data Analyst tab to view and customise it._"
+        except RuntimeError as e:
+            return f"⚠️ {e}"
+
+    elif agent_key == "my_documents":
+        if not is_logged_in:
+            return "⚠️ My Documents requires you to be signed in."
+        user_docs = get_user_documents(username)
+        if not user_docs:
+            return "⚠️ You have no documents uploaded yet. Go to My Documents tab to upload some."
+        result = user_rag_ask(username=username, question=query, chat_history=st.session_state.auto_messages)
+        answer = result["answer"]
+        if result.get("sources"):
+            answer += "\n\n**Sources:** " + " · ".join(
+                f"{s['filename']} p.{s['page']}" for s in result["sources"]
+            )
+        return answer
+
+    return "⚠️ Unknown agent."
+
+
 # --------------------------------------------------
 # Sidebar
 # --------------------------------------------------
 with st.sidebar:
-    st.title("ATOM")
+    st.markdown(
+        "<div style='font-family:var(--font-display);font-size:26px;font-weight:800;"
+        "color:#fff;letter-spacing:-0.5px;padding:4px 0 12px 0;"
+        "text-shadow:0 0 22px rgba(99,102,241,0.6);'>ATOM</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Auto / Manual toggle ──────────────────────────────────────────────
+    st.markdown(
+        "<p style='font-size:11px;color:var(--text-tertiary);letter-spacing:0.5px;"
+        "text-transform:uppercase;margin-bottom:4px;font-family:var(--font-body);'>"
+        "Mode</p>",
+        unsafe_allow_html=True,
+    )
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        if st.button(
+            "🤖 Auto",
+            use_container_width=True,
+            type="primary" if st.session_state.auto_mode else "secondary",
+        ):
+            st.session_state.auto_mode = True
+            st.rerun()
+    with mc2:
+        if st.button(
+            "🎛 Manual",
+            use_container_width=True,
+            type="primary" if not st.session_state.auto_mode else "secondary",
+        ):
+            st.session_state.auto_mode = False
+            st.rerun()
+
+    st.divider()
 
     # ── User status badge ─────────────────────────────────────────────────
     sidebar_user_badge(is_logged_in, user_name, username)
@@ -153,15 +255,27 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Agent selector ────────────────────────────────────────────────────
-    st.session_state.active_agent = st.radio(
-        "Choose Agent",
-        ["⚛️ ATOM AI OS", "Finance Planner", "Stock Market RAG", "Data Analyst", "My Documents"],
-    )
+    # ── Agent selector (Manual mode only) ────────────────────────────────
+    if not st.session_state.auto_mode:
+        st.session_state.active_agent = st.radio(
+            "Choose Agent",
+            ["ATOM AI OS", "Finance Planner", "Stock Market RAG", "Data Analyst", "My Documents"],
+        )
 
-    if st.session_state.active_agent == "Stock Market RAG":
-        st.subheader("Answer Style")
+        if st.session_state.active_agent == "Stock Market RAG":
+         st.markdown(
+        "<p style='font-size:12px;color:var(--text-tertiary);letter-spacing:0.5px;"
+        "text-transform:uppercase;margin-bottom:4px;font-family:var(--font-body);'>"
+        "Answer Style</p>",
+        unsafe_allow_html=True,
+    )
         st.session_state.answer_style = st.radio("Select Style", ["Detailed", "Concise"])
+    else:
+        st.markdown(
+            "<p style='font-size:12px;color:var(--text-tertiary);font-family:var(--font-body);"
+            "padding:4px 0;'>Agent selection is automatic in Auto mode.</p>",
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
@@ -169,32 +283,41 @@ with st.sidebar:
         st.session_state.show_intro = True
         st.rerun()
 
-    if st.session_state.active_agent == "⚛️ ATOM AI OS":
-        if st.button("🗑 Clear AI OS Chat"):
-            st.session_state.workspace_messages = []
+    # ── Clear buttons (context-sensitive) ────────────────────────────────
+    if st.session_state.auto_mode:
+        if st.button("🗑 Clear Auto Chat"):
+            st.session_state.auto_messages      = []
+            st.session_state.auto_pending_query = None
+            st.session_state.auto_pending_route = None
+            st.session_state.auto_awaiting_conf = False
             st.rerun()
+    else:
+        if st.session_state.active_agent == "⚛️ ATOM AI OS":
+            if st.button("🗑 Clear AI OS Chat"):
+                st.session_state.workspace_messages = []
+                st.rerun()
 
-    if st.session_state.active_agent == "Finance Planner":
-        if st.button("🗑 Clear Finance Chat"):
-            if is_logged_in: clear_finance_history(username)
-            st.session_state.finance_messages = []
-            st.rerun()
+        if st.session_state.active_agent == "Finance Planner":
+            if st.button("🗑 Clear Finance Chat"):
+                if is_logged_in: clear_finance_history(username)
+                st.session_state.finance_messages = []
+                st.rerun()
 
-    if st.session_state.active_agent == "Stock Market RAG":
-        if st.button("🗑 Clear RAG Chat"):
-            if is_logged_in: clear_rag_history(username)
-            st.session_state.rag_messages = []
-            st.rerun()
+        if st.session_state.active_agent == "Stock Market RAG":
+            if st.button("🗑 Clear RAG Chat"):
+                if is_logged_in: clear_rag_history(username)
+                st.session_state.rag_messages = []
+                st.rerun()
 
-    if st.session_state.active_agent == "Data Analyst":
-        if st.button("🗑 Clear Analysis History"):
-            if is_logged_in: delete_analysis_history(username)
-            st.session_state.da_history      = []
-            st.session_state.da_fig          = None
-            st.session_state.da_answer       = None
-            st.session_state.da_plan         = None
-            st.session_state.da_chart_override = None
-            st.rerun()
+        if st.session_state.active_agent == "Data Analyst":
+            if st.button("🗑 Clear Analysis History"):
+                if is_logged_in: delete_analysis_history(username)
+                st.session_state.da_history        = []
+                st.session_state.da_fig            = None
+                st.session_state.da_answer         = None
+                st.session_state.da_plan           = None
+                st.session_state.da_chart_override = None
+                st.rerun()
 
     st.divider()
 
@@ -208,6 +331,7 @@ with st.sidebar:
     st.divider()
     if is_logged_in:
         authenticator.logout("🚪 Logout", location="sidebar")
+
 
 # --------------------------------------------------
 # PASSWORD RESET (URL token)
@@ -254,6 +378,7 @@ if st.session_state.get("show_reset_flow") and st.session_state.get("reset_token
 
     st.markdown("---")
     st.stop()
+
 
 # --------------------------------------------------
 # AUTH MODAL
@@ -311,6 +436,7 @@ if st.session_state.get("show_auth_modal") and not is_logged_in:
                 with open(auth_config_path, "w", encoding="utf-8") as yf:
                     yaml.dump(auth_cfg, yf, default_flow_style=False, allow_unicode=True)
                 st.success(f"Account created! You can now sign in as **{new_username}**.")
+                st.rerun()
 
     with forgot_tab:
         st.markdown("Enter the email address linked to your account:")
@@ -347,6 +473,7 @@ if st.session_state.get("show_auth_modal") and not is_logged_in:
     st.markdown("---")
     st.stop()
 
+
 # --------------------------------------------------
 # INTRO SCREEN
 # --------------------------------------------------
@@ -367,40 +494,38 @@ if st.session_state.show_intro:
         f"Welcome back, <strong style='color:var(--accent-text);'>{user_name}</strong></p>",
         unsafe_allow_html=True,
     )
-    
-    st.markdown("""
-<div style='text-align:center;margin-bottom:8px;'>
-  <span id='typewriter'
-    style='font-size:18px;color:var(--accent-text);font-family:var(--font-body);
-           font-weight:400;letter-spacing:0.3px;'></span>
-  <span style='color:var(--accent);animation:atomCursor 0.75s step-end infinite;
-               font-weight:300;'>|</span>
-</div>
 
-<script>
-const phrases = [
-  "Your AI OS is live.",
-  "Search. Reason. Create.",
-  "Intelligence, on demand.",
-  "Built for what's next."
-];
-let pi = 0, ci = 0, deleting = false;
-const el = document.getElementById('typewriter');
-
-function type() {
-  const phrase = phrases[pi];
-  if (!deleting) {
-    el.textContent = phrase.slice(0, ++ci);
-    if (ci === phrase.length) { deleting = true; setTimeout(type, 1800); return; }
-  } else {
-    el.textContent = phrase.slice(0, --ci);
-    if (ci === 0) { deleting = false; pi = (pi + 1) % phrases.length; }
-  }
-  setTimeout(type, deleting ? 45 : 80);
-}
-type();
-</script>
-""", unsafe_allow_html=True)
+    # Typewriter subtitle — uses components.html so script executes
+    components.html("""
+    <div style='text-align:center;'>
+      <span id='tw'
+        style='font-size:18px;color:#a5b4fc;font-family:"DM Sans",sans-serif;
+               font-weight:400;letter-spacing:0.3px;'></span>
+      <span style='color:#6366f1;'>|</span>
+    </div>
+    <script>
+    const phrases = [
+      "Your AI OS is live.",
+      "Search. Reason. Create.",
+      "Intelligence, on demand.",
+      "Built for what's next."
+    ];
+    let pi = 0, ci = 0, deleting = false;
+    const el = document.getElementById('tw');
+    function type() {
+      const phrase = phrases[pi];
+      if (!deleting) {
+        el.textContent = phrase.slice(0, ++ci);
+        if (ci === phrase.length) { deleting = true; setTimeout(type, 1800); return; }
+      } else {
+        el.textContent = phrase.slice(0, --ci);
+        if (ci === 0) { deleting = false; pi = (pi + 1) % phrases.length; }
+      }
+      setTimeout(type, deleting ? 45 : 80);
+    }
+    type();
+    </script>
+    """, height=35)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -430,15 +555,263 @@ type();
 
     st.stop()
 
-# --------------------------------------------------
-# ⚛️ ATOM AI OS — General Intelligence Workspace
-# --------------------------------------------------
-if st.session_state.active_agent == "⚛️ ATOM AI OS":
 
-    page_title("⚛️ ATOM AI OS", "Ask anything · Web search · Code · Writing · Research")
+# ══════════════════════════════════════════════════════════
+# AUTO MODE
+# ══════════════════════════════════════════════════════════
+if st.session_state.auto_mode:
+
+    # ── Clean hero when chat is empty ─────────────────────────────────────
+    if (
+        not st.session_state.auto_messages
+        and not st.session_state.auto_awaiting_conf
+        and st.session_state.auto_pending_upload is None
+    ):
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        components.html("""
+        <div style='text-align:center;'>
+          <div style='font-family:"Syne",sans-serif;font-size:52px;font-weight:800;
+            background:linear-gradient(90deg,#fff 0%,#a5b4fc 55%,#818cf8 100%);
+            background-size:200%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;
+            animation:slide 5s linear infinite;margin-bottom:12px;'>ATOM</div>
+          <div>
+            <span id='atw' style='font-size:20px;color:#a5b4fc;
+              font-family:"DM Sans",sans-serif;font-weight:400;letter-spacing:0.2px;'></span>
+            <span style='color:#6366f1;font-size:20px;'>|</span>
+          </div>
+          <p style='font-size:13px;color:rgba(255,255,255,0.3);
+            font-family:"DM Sans",sans-serif;margin-top:10px;'>
+            Type anything below — ATOM figures out the rest.
+          </p>
+        </div>
+        <style>
+          @keyframes slide{0%{background-position:0%}100%{background-position:200%}}
+        </style>
+        <script>
+          const ph = [
+            "Route me to the right agent.",
+            "I'll figure out what you need.",
+            "One box. Every answer.",
+            "Just ask. I'll handle it."
+          ];
+          let pi=0, ci=0, del=false;
+          const el = document.getElementById('atw');
+          function t() {
+            const p = ph[pi];
+            if (!del) {
+              el.textContent = p.slice(0, ++ci);
+              if (ci === p.length) { del=true; setTimeout(t, 1900); return; }
+            } else {
+              el.textContent = p.slice(0, --ci);
+              if (ci === 0) { del=false; pi=(pi+1)%ph.length; }
+            }
+            setTimeout(t, del ? 40 : 75);
+          }
+          t();
+        </script>
+        """, height=200)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── File upload picker ────────────────────────────────────────────────
+    if st.session_state.auto_pending_upload is None:
+        auto_upload = st.file_uploader(
+            "📎 Upload a file — ATOM will ask where to send it",
+            type=["csv", "xlsx", "xls", "pdf", "docx", "txt"],
+            key="auto_uploader",
+        )
+        if auto_upload:
+            st.session_state.auto_pending_upload = {
+                "name":      auto_upload.name,
+                "bytes":     auto_upload.read(),
+                "suggested": suggest_upload_agent(
+                    auto_upload.name,
+                    auto_upload.name.rsplit(".", 1)[-1]
+                ),
+            }
+            st.rerun()
+
+    # ── Upload destination picker ─────────────────────────────────────────
+    if st.session_state.auto_pending_upload is not None:
+        upload_info = st.session_state.auto_pending_upload
+        st.markdown(
+            f"<div style='background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.3);"
+            f"border-radius:12px;padding:16px 20px;margin-bottom:16px;'>"
+            f"<p style='color:var(--accent-text);font-size:14px;font-weight:500;margin:0 0 4px 0;'>"
+            f"📄 <strong>{upload_info['name']}</strong> ready to send.</p>"
+            f"<p style='color:var(--text-tertiary);font-size:12px;margin:0;'>"
+            f"Where should this go?</p></div>",
+            unsafe_allow_html=True,
+        )
+        up1, up2, up3 = st.columns([1, 1, 1])
+
+        with up1:
+            if st.button("📊 Data Analyst", use_container_width=True):
+                if st.session_state.data_agent is None:
+                    st.session_state.data_agent = DataAnalystAgent()
+                import io
+                file_like      = io.BytesIO(upload_info["bytes"])
+                file_like.name = upload_info["name"]
+                try:
+                    sheets = DataAnalystAgent.read_file(file_like)
+                    for sname, raw_df in sheets.items():
+                        label = (
+                            upload_info["name"] if len(sheets) == 1
+                            else f"{upload_info['name']} — {sname}"
+                        )
+                        st.session_state.data_agent.load_dataframe(raw_df, source_name=label)
+                        st.session_state.da_source_names.append(label)
+                    st.session_state.data_loaded = True
+                    st.session_state.auto_messages.append({
+                        "role":    "assistant",
+                        "content": (
+                            f"✅ **{upload_info['name']}** loaded into Data Analyst. "
+                            "Ask me data questions about it here, or switch to the "
+                            "Data Analyst tab for full chart controls."
+                        ),
+                        "agent": "data_analyst",
+                    })
+                except Exception as e:
+                    st.error(f"Could not load file: {e}")
+                st.session_state.auto_pending_upload = None
+                st.rerun()
+
+        with up2:
+            if st.button("📂 My Documents", use_container_width=True):
+                if not is_logged_in:
+                    st.error("My Documents requires you to be signed in.")
+                else:
+                    with st.spinner(f"Indexing {upload_info['name']}…"):
+                        result = upload_document(username, upload_info["bytes"], upload_info["name"])
+                    if result["success"]:
+                        st.session_state.auto_messages.append({
+                            "role":    "assistant",
+                            "content": (
+                                f"✅ **{upload_info['name']}** indexed — "
+                                f"{result['pages']} pages · {result['chunks']} chunks. "
+                                "Ask me anything about it."
+                            ),
+                            "agent": "my_documents",
+                        })
+                    else:
+                        st.error(f"❌ {result['message']}")
+                    st.session_state.auto_pending_upload = None
+                    st.rerun()
+
+        with up3:
+            if st.button("❌ Cancel", use_container_width=True):
+                st.session_state.auto_pending_upload = None
+                st.rerun()
+
+        st.stop()
+
+    # ── Render auto chat history ──────────────────────────────────────────
+    for msg in st.session_state.auto_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("agent"):
+                meta = AGENT_META.get(msg["agent"], {})
+                st.caption(f"{meta.get('icon','🤖')} {meta.get('label','ATOM')}")
+
+    # ── Routing confirmation buttons ──────────────────────────────────────
+    if st.session_state.auto_awaiting_conf and st.session_state.auto_pending_route:
+        route      = st.session_state.auto_pending_route
+        agent      = route["agent"]
+        query      = st.session_state.auto_pending_query
+        meta       = AGENT_META.get(agent, AGENT_META["ai_os"])
+        alternates = route["alternates"]
+
+        cc1, cc2 = st.columns([1, 1])
+        with cc1:
+            if st.button("✅ Yes, go ahead", use_container_width=True):
+                with st.chat_message("assistant"):
+                    with st.spinner(f"Running {meta['label']}…"):
+                        answer = _run_agent(agent, query)
+                    st.markdown(answer)
+                    st.caption(f"{meta['icon']} {meta['label']}")
+                st.session_state.auto_messages.append({
+                    "role": "assistant", "content": answer, "agent": agent,
+                })
+                st.session_state.auto_awaiting_conf = False
+                st.session_state.auto_pending_route = None
+                st.session_state.auto_pending_query = None
+                st.rerun()
+
+        with cc2:
+            if st.button("🔄 Switch agent", use_container_width=True):
+                st.session_state.auto_awaiting_conf = False
+                st.session_state.auto_pending_route["show_alternates"] = True
+                st.rerun()
+
+        # Alternate agent buttons
+        if route.get("show_alternates"):
+            st.markdown(
+                "<p style='color:var(--text-secondary);font-size:13px;margin-top:8px;'>"
+                "Choose a different agent:</p>",
+                unsafe_allow_html=True,
+            )
+            alt_cols = st.columns(len(alternates))
+            for i, alt_key in enumerate(alternates):
+                alt_meta = AGENT_META.get(alt_key, {})
+                with alt_cols[i]:
+                    if st.button(
+                        f"{alt_meta.get('icon','')} {alt_meta.get('label', alt_key)}",
+                        key=f"alt_{alt_key}",
+                        use_container_width=True,
+                    ):
+                        with st.chat_message("assistant"):
+                            with st.spinner(f"Running {alt_meta['label']}…"):
+                                answer = _run_agent(alt_key, query)
+                            st.markdown(answer)
+                            st.caption(f"{alt_meta.get('icon','🤖')} {alt_meta['label']}")
+                        st.session_state.auto_messages.append({
+                            "role": "assistant", "content": answer, "agent": alt_key,
+                        })
+                        st.session_state.auto_pending_route = None
+                        st.session_state.auto_pending_query = None
+                        st.rerun()
+
+    # ── Chat input ────────────────────────────────────────────────────────
+    if not st.session_state.auto_awaiting_conf:
+        if query := st.chat_input("Ask anything — ATOM will route it automatically…"):
+            st.session_state.auto_messages.append({"role": "user", "content": query})
+            with st.chat_message("user"):
+                st.markdown(query)
+
+            has_user_docs = bool(is_logged_in and get_user_documents(username))
+            route = classify_query(
+                query         = query,
+                data_loaded   = st.session_state.data_loaded,
+                has_user_docs = has_user_docs,
+                rag_ready     = st.session_state.rag_ready,
+            )
+
+            conf_msg = build_routing_message(route["agent"], route["confidence"], route["reason"])
+            st.session_state.auto_messages.append({
+                "role": "assistant", "content": conf_msg, "agent": None,
+            })
+            with st.chat_message("assistant"):
+                st.markdown(conf_msg)
+
+            st.session_state.auto_pending_query = query
+            st.session_state.auto_pending_route = route
+            st.session_state.auto_awaiting_conf = True
+            st.rerun()
+
+    st.stop()
+
+
+# ══════════════════════════════════════════════════════════
+# MANUAL MODE — individual agents (your original code, unchanged)
+# ══════════════════════════════════════════════════════════
+
+# --------------------------------------------------
+# ATOM AI OS — General Intelligence Workspace
+# --------------------------------------------------
+if st.session_state.active_agent == "ATOM AI OS":
+
+    page_title("ATOM AI OS", "Ask anything · Web search · Code · Writing · Research")
     capability_chips(["🔍 Live Search", "💻 Code Help", "✍️ Writing", "📚 Research", "🧠 Reasoning"])
 
-    # ── Chat history ──────────────────────────────────────────────────────
     for msg in st.session_state.workspace_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -459,7 +832,6 @@ if st.session_state.active_agent == "⚛️ ATOM AI OS":
                 mode_label = "Web Search + AI" if msg["mode"] == "search" else "Direct AI Reasoning"
                 st.caption(f"{mode_icon} {mode_label}")
 
-    # ── Suggested prompts (empty state) ──────────────────────────────────
     if not st.session_state.workspace_messages:
         st.markdown("---")
         st.markdown(
@@ -648,7 +1020,6 @@ elif st.session_state.active_agent == "Data Analyst":
         ["📋 Data Summary", "🤖 Ask AI", "📜 History"]
     )
 
-    # ── TAB 1: SUMMARY ────────────────────────────────────────────────────
     with tab_summary:
         summary = st.session_state.data_agent.get_data_summary()
 
@@ -680,7 +1051,6 @@ elif st.session_state.active_agent == "Data Analyst":
         n_rows = st.slider("Rows to show", min_value=5, max_value=100, value=10, step=5)
         st.dataframe(st.session_state.data_agent.df.head(n_rows), use_container_width=True)
 
-    # ── TAB 2: ASK AI ─────────────────────────────────────────────────────
     with tab_analyse:
         question = st.text_input(
             "Ask about your dataset",
@@ -730,7 +1100,7 @@ elif st.session_state.active_agent == "Data Analyst":
 
                 st.markdown("---")
                 st.markdown("**🎨 Colour**")
-                color_mode  = st.radio(
+                color_mode = st.radio(
                     "mode", ["Palette", "Single colour"],
                     index=0 if st.session_state.da_use_palette else 1,
                     label_visibility="collapsed",
@@ -790,7 +1160,6 @@ elif st.session_state.active_agent == "Data Analyst":
                     f"Agg: **{plan.get('agg_func') or '—'}**"
                 )
 
-    # ── TAB 3: HISTORY ────────────────────────────────────────────────────
     with tab_history:
         history = st.session_state.da_history
 
@@ -832,7 +1201,6 @@ elif st.session_state.active_agent == "My Documents":
 
     doc_col, chat_col = st.columns([1, 2])
 
-    # ── LEFT: Document Manager ────────────────────────────────────────────
     with doc_col:
         st.markdown("#### 📁 Your Documents")
 
@@ -882,7 +1250,6 @@ elif st.session_state.active_agent == "My Documents":
                         else:
                             st.error(result["message"])
 
-    # ── RIGHT: Chat ───────────────────────────────────────────────────────
     with chat_col:
         st.markdown("#### 💬 Ask About Your Documents")
 
@@ -934,4 +1301,3 @@ elif st.session_state.active_agent == "My Documents":
             if st.button("🗑 Clear Chat", key="clear_user_rag_chat"):
                 st.session_state.user_rag_messages = []
                 st.rerun()
-               
